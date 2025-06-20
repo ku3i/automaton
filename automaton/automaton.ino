@@ -1,12 +1,13 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <VL53L0X.h>
+//#include <VL53L0X.h>
+#include "Adafruit_VL53L0X.h"
 #include <ESP32Servo.h>
 
 // for the audio DFplayer
 #include "DFRobotDFPlayerMini.h"
-//#include <DFPlayerMini_Fast.h>
+
 
 #define FPSerial Serial1
 
@@ -14,7 +15,9 @@
 #define TARGET_LOW 1425
 
 Adafruit_MPU6050 mpu;
-VL53L0X sensor;
+//VL53L0X sensor;
+
+Adafruit_VL53L0X sensor = Adafruit_VL53L0X();
 Servo esc0;
 
 DFRobotDFPlayerMini audio;
@@ -31,21 +34,22 @@ int target_lp = TARGET_LOW;
 bool armed = false;
 
 
-float e=0;
 
-float rotation = 0;
+
+
 
 unsigned idle_counter = 0;
 
 /* proximity sensing */
-const float dist_max_mm = 2000.0f;
-float dist_mm = 0;
+const float dist_max_mm = 1200.0f;
+float dist_mm = 1200.f;
 float proximity_detected = 0.f;
-float proximity_into = 500;
-float proximity_left = 700;
+float proximity_into = 500.f;
+float proximity_left = 700.f;
 float proximity_decay = 0.95f;
-
-uint8_t cycle=0;
+float persistence = -1.f;
+float rotation = 0.f;
+float e = 0.f;
 
 bool state_sensor_active = false;
 bool state_motor_start = false;
@@ -62,8 +66,7 @@ enum Sound_t : uint8_t {
 } playsound = s_done;
 
 
-float persistence = -1.f;
-  
+
 void printDetail(uint8_t type, int value);
 
 
@@ -88,6 +91,14 @@ bool button_pressed(uint8_t N = 3)
   return button_integ>=N;
 }
 
+bool button_released() { 
+  const bool buttonstate = !digitalRead(BUTTON);
+
+  if (!buttonstate) 
+    button_integ = 0;
+
+  return buttonstate == 0;
+}
 
 void setup()
 {
@@ -99,15 +110,19 @@ void setup()
   Serial.begin(115200);
   FPSerial.begin(9600, SERIAL_8N1, /*rx =*/D7, /*tx =*/D6);
 
+  delay(100);
+
   /* Audio */
   if (!audio.begin(FPSerial, /*isACK = */true, /*doReset = */true)) {  //Use serial to communicate with mp3.
     Serial.println("Cannot initialize DFPlayer.");
     while(1) delay(0);
   }
   Serial.println("DFPlayer initialized.");
+  delay(100);
   audio.setTimeOut(1000);
   audio.volume(30);  // set volume value [0...30]
   audio.playFolder(2, 3);
+
 
   /* MPU */
   if (!mpu.begin()) {
@@ -118,10 +133,17 @@ void setup()
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+  delay(100);
 
   /* Distance Sensor */
-  sensor.init();
-  sensor.setTimeout(500);
+  if (!sensor.begin()) {
+    Serial.println("Failed to boot VL53L0X");
+    while(1);
+  }
+  delay(100);
+  sensor.startRangeContinuous();
+  //sensor.init();
+  //sensor.setTimeout(500);
 
   /* Motor */
   pinMode(PWMPIN, OUTPUT);
@@ -152,8 +174,14 @@ void loop()
   timer = millis();
   
   /* read distance sensor */
-  int s = sensor.readRangeSingleMillimeters();
-  float dist_mm = clamp(s - 50.f, 0.f, dist_max_mm); //in mm
+  
+  if (sensor.isRangeComplete())
+  {
+    //int s = sensor.readRangeSingleMillimeters();
+    int s = sensor.readRange();
+    dist_mm = clamp(s - 50.f, 0.f, dist_max_mm); //in mm
+  }
+  
  
   if (dist_mm < proximity_into) proximity_detected = 1.0f;
   if (dist_mm > proximity_left) proximity_detected *= proximity_decay;  
@@ -165,8 +193,8 @@ void loop()
   /* read and clamp potentiometers */
   unsigned pot_a = analogRead(POTI_A);
   unsigned pot_b = analogRead(POTI_B);
-  float val_a = clamp(pot_a, 0u, 4095u) / 4095.f; //[0,1]
-  float val_b = clamp(pot_b, 0u, 4095u) / 4095.f; //[0,1]
+  float val_a = clamp(pot_a, 0u, 4095u) / 4095.f; //[0,1] 0.5 is super
+  float val_b = clamp(pot_b, 0u, 4095u) / 4095.f; //[0,1] 0.5 is best
 
   /* get button state */
   bool state = digitalRead(BUTTON);
@@ -178,21 +206,25 @@ void loop()
 
   
   /* check for arming the ESC */
-  if (!armed and button_pressed())
+  if (button_pressed())
   {
-    Serial.printf("motor unlocked");
-    esc0.writeMicroseconds(1000);
-    delay(1000);
-    esc0.writeMicroseconds(500);
-    delay(500);
-    armed = true;
-    persistence = -1.0;
-  } else 
-  if (armed and button_pressed())
-  {
-    Serial.printf("motor stopped");
-    esc0.writeMicroseconds(500);
-    armed = false;
+    if (!armed)
+    {
+      Serial.printf("motor unlocked");
+      esc0.writeMicroseconds(1000);
+      delay(1000);
+      esc0.writeMicroseconds(500);
+      delay(500);
+      armed = true;
+      persistence = -1.0;
+      while (not button_released());
+    } else 
+    {
+      Serial.printf("motor stopped");
+      esc0.writeMicroseconds(500);
+      armed = false;
+      while (not button_released());
+    }
   }
 
   /* create control outputs */
@@ -201,21 +233,22 @@ void loop()
   if (proximity_detected > 0.5)
   {
     control = proximity_detected;
-    persistence += 0.05;
+    persistence += 0.02;
   } 
   else {
     persistence -= 0.01;
     control = e * clamp(persistence, 0.f, 1.0f); //keep going
   }
 
-  persistence = clamp(persistence, -1.0f, 10.0f);
+  persistence = clamp(persistence, -1.0f, 50.0f);
 
-  //if (idle_counter > 100 and idle_counter % 50 == 0) 
-  //  control = 1;
+  //if (idle_counter > 200)
+  //  control = e * 0.2;  does not work
+  
   int target_us = val_a*control*200 + TARGET_LOW;
 
   /* low-pass filter the output */
-  float k = 0.94; 
+  float k = 0.96; 
   target_lp = k*target_lp + (1.f-k)*target_us;
 
   /* set motor output */
@@ -246,10 +279,10 @@ void loop()
   }
 
   // STOP / IDLE
-  if (control < 0.01f and state_motor_start) {
+  /*if (control < 0.01f and state_motor_start) {
     state_motor_start = false;
     reset_idle();
-  }
+  }*/
 
   if (++idle_counter > 100 and not state_idle) {
     playsound = Sound_t::s_stop_idle;
