@@ -4,14 +4,20 @@
 #include <VL53L0X.h>
 #include <ESP32Servo.h>
 
+// for the audio DFplayer
+#include "DFRobotDFPlayerMini.h"
+//#include <DFPlayerMini_Fast.h>
 
-#define WAIT_MS 20
+#define FPSerial Serial1
+
+#define WAIT_MS 10
 #define TARGET_LOW 1425
 
 Adafruit_MPU6050 mpu;
 VL53L0X sensor;
-
 Servo esc0;
+
+DFRobotDFPlayerMini audio;
 
 const uint8_t LEDYWL = D10;
 const uint8_t BUTTON = D8;
@@ -19,29 +25,46 @@ const uint8_t POTI_A = A0;
 const uint8_t POTI_B = A1;
 const uint8_t PWMPIN = D3;
 
-const unsigned max_cycles = 4000/WAIT_MS; // num cycles per 2 seconds
-
 int button_integ = 0;
 int target_lp = TARGET_LOW;
 
 bool armed = false;
 
-unsigned cycles = 0;
-unsigned wait_cycles = max_cycles;
-unsigned waited = 0;
 
-unsigned tick = 0;
 float e=0;
 
-float e_x =0;
+float rotation = 0;
+
+unsigned idle_counter = 0;
 
 /* proximity sensing */
 const float dist_max_mm = 2000.0f;
 float dist_mm = 0;
 float proximity_detected = 0.f;
-float proximity_into = 400;
-float proximity_left = 500;
+float proximity_into = 500;
+float proximity_left = 700;
 float proximity_decay = 0.95f;
+
+uint8_t cycle=0;
+
+bool state_sensor_active = false;
+bool state_motor_start = false;
+bool state_idle = false;
+
+/* audio events: */
+enum Sound_t : uint8_t {
+  s_done          = 0,
+  s_sensor_active = 1,
+  s_sensor_clear  = 2,
+  s_motor_start   = 3,
+  s_motor_fast    = 4,
+  s_stop_idle     = 6,
+} playsound = s_done;
+
+
+float persistence = -1.f;
+  
+void printDetail(uint8_t type, int value);
 
 
 /* clamps values to Interval [lo, hi] */
@@ -55,70 +78,57 @@ bool button_pressed(uint8_t N = 3)
 {
   const bool buttonstate = !digitalRead(BUTTON);
 
-  button_integ += buttonstate ? 1 : -1;
+  if (buttonstate)
+    button_integ += 1;
+  else 
+    button_integ = 0;
+
   button_integ = clamp(button_integ, 0, 2*N);
 
   return button_integ>=N;
 }
 
 
-void setup() {
-  pinMode(PWMPIN, OUTPUT);
+void setup()
+{
+  /* LED and Button */
   pinMode(LEDYWL, OUTPUT);
   pinMode(BUTTON, INPUT_PULLUP);
+  
+  /* Serial Ports */
   Serial.begin(115200);
+  FPSerial.begin(9600, SERIAL_8N1, /*rx =*/D7, /*tx =*/D6);
 
+  /* Audio */
+  if (!audio.begin(FPSerial, /*isACK = */true, /*doReset = */true)) {  //Use serial to communicate with mp3.
+    Serial.println("Cannot initialize DFPlayer.");
+    while(1) delay(0);
+  }
+  Serial.println("DFPlayer initialized.");
+  audio.setTimeOut(1000);
+  audio.volume(30);  // set volume value [0...30]
+  audio.playFolder(2, 3);
+
+  /* MPU */
   if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+    Serial.println("Cannot initialize MPU6050.");
+    while (1) delay(10);
   }
-  Serial.println("MPU6050 Found!");
+  Serial.println("MPU6050 initialized.");
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-
-  Serial.print("Accelerometer range set to: ");
-  switch (mpu.getAccelerometerRange()) {
-  case MPU6050_RANGE_2_G:  Serial.println("+-2G");  break;
-  case MPU6050_RANGE_4_G:  Serial.println("+-4G");  break;
-  case MPU6050_RANGE_8_G:  Serial.println("+-8G");  break;
-  case MPU6050_RANGE_16_G: Serial.println("+-16G"); break;
-  }
-
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  Serial.print("Gyro range set to: ");
-  switch (mpu.getGyroRange()) {
-  case MPU6050_RANGE_250_DEG:  Serial.println("+- 250 deg/s");  break;
-  case MPU6050_RANGE_500_DEG:  Serial.println("+- 500 deg/s");  break;
-  case MPU6050_RANGE_1000_DEG: Serial.println("+- 1000 deg/s"); break;
-  case MPU6050_RANGE_2000_DEG: Serial.println("+- 2000 deg/s"); break;
-  }
-
   mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
-  Serial.print("Filter bandwidth set to: ");
-  switch (mpu.getFilterBandwidth()) {
-  case MPU6050_BAND_260_HZ: Serial.println("260 Hz"); break;
-  case MPU6050_BAND_184_HZ: Serial.println("184 Hz"); break;
-  case MPU6050_BAND_94_HZ:  Serial.println("94 Hz");  break;
-  case MPU6050_BAND_44_HZ:  Serial.println("44 Hz");  break;
-  case MPU6050_BAND_21_HZ:  Serial.println("21 Hz");  break;
-  case MPU6050_BAND_10_HZ:  Serial.println("10 Hz");  break;
-  case MPU6050_BAND_5_HZ:   Serial.println("5 Hz");   break;
-  }
 
-
-  /* init distance sensor */
+  /* Distance Sensor */
   sensor.init();
   sensor.setTimeout(500);
 
-  Serial.println("");
-  delay(100);
+  /* Motor */
+  pinMode(PWMPIN, OUTPUT);
+  esc0.attach(PWMPIN, 1000, 2000); // (pin, min pulse width, max pulse width in microseconds) 
+  Serial.println("Motor initialized.");
 
-
-  esc0.attach(PWMPIN,1000,2000); // (pin, min pulse width, max pulse width in microseconds) 
   delay(1000);
-  //esc0.writeMicroseconds(ARMING_MS); // arm esc
-
 }
 
 
@@ -126,41 +136,31 @@ float db(float x, float t) {
   return fabs(x) > t ? x : 0;
 }
 
+void reset_idle() {
+  idle_counter = 0;
+  state_idle = false;
+}
+
 void loop() 
 {
-  if (cycles % wait_cycles == 0)
-    tick = 1;
+  static unsigned long timer = millis();
 
-  if (1==tick) {
-    ++waited;
-    if (waited >= wait_cycles/4){
-      tick = 0;
-      waited = 0;
-    }
-  }
-
-  // replace by timer.
-  digitalWrite(LEDYWL, HIGH);
-  delay(WAIT_MS/2);
-  digitalWrite(LEDYWL, LOW);
-  delay(WAIT_MS/2);
-
+  /* timing */
+  digitalWrite(LEDYWL, !digitalRead(LEDYWL));
+  
+  while(millis() - timer < WAIT_MS) delay(1);
+  timer = millis();
+  
   /* read distance sensor */
   int s = sensor.readRangeSingleMillimeters();
-
-  float sinp_mm = clamp(s - 50.f, 0.f, dist_max_mm); //in mm
-  float h = 0.25;
-  dist_mm = sinp_mm * (1.0 - h) + dist_mm * h;
-
+  float dist_mm = clamp(s - 50.f, 0.f, dist_max_mm); //in mm
+ 
   if (dist_mm < proximity_into) proximity_detected = 1.0f;
   if (dist_mm > proximity_left) proximity_detected *= proximity_decay;  
 
   /* get new motion sensor readings */
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-
-  //float A = 10 * clamp((float)(a.acceleration.y / 9.81f), 0.0f, 0.1f); // [0,1]
-  //float G = clamp((float)(g.gyro.z * 10000), 0.0f, 1.0f); // [-1,1]
 
   /* read and clamp potentiometers */
   unsigned pot_a = analogRead(POTI_A);
@@ -172,32 +172,47 @@ void loop()
   bool state = digitalRead(BUTTON);
     
   /* calculate the gyroscopic input */ 
-  e_x = db(g.gyro.x, 10*val_b) == 0.0f ? 1.0 : 0.9 * e_x; /*turning thresh*/
-  //float e_y = clamp(100 * db(-g.gyro.z, 0.1), 0.f, 1.0f);
+  rotation = db(g.gyro.x, 10*val_b) == 0.0f ? 1.0 : 0.9 * rotation; /*turning thresh*/
   float e_y = clamp(100 * db(-g.gyro.z, 0.1/*motion thresh*/), 0.f, 1.0f);
-  e = e_x * e_y;
+  e = rotation * e_y;
 
-  /* create wait cycles from potentiometer */
-  wait_cycles = max_cycles * val_b;
-
-  /* check for arming the ESC */
-  if (!armed and button_pressed(3))
-  {
-    Serial.printf("Arming unlocked");
-    esc0.writeMicroseconds(1000);
-    delay(500);
-    armed = true;
-  }
   
-  if (armed and button_pressed(5))
+  /* check for arming the ESC */
+  if (!armed and button_pressed())
   {
+    Serial.printf("motor unlocked");
+    esc0.writeMicroseconds(1000);
+    delay(1000);
     esc0.writeMicroseconds(500);
     delay(500);
+    armed = true;
+    persistence = -1.0;
+  } else 
+  if (armed and button_pressed())
+  {
+    Serial.printf("motor stopped");
+    esc0.writeMicroseconds(500);
+    armed = false;
   }
 
   /* create control outputs */
-  float control = val_a * e * proximity_detected;
-  int target_us = control*200 + TARGET_LOW;
+  float control = 0;
+
+  if (proximity_detected > 0.5)
+  {
+    control = proximity_detected;
+    persistence += 0.05;
+  } 
+  else {
+    persistence -= 0.01;
+    control = e * clamp(persistence, 0.f, 1.0f); //keep going
+  }
+
+  persistence = clamp(persistence, -1.0f, 10.0f);
+
+  //if (idle_counter > 100 and idle_counter % 50 == 0) 
+  //  control = 1;
+  int target_us = val_a*control*200 + TARGET_LOW;
 
   /* low-pass filter the output */
   float k = 0.94; 
@@ -208,13 +223,90 @@ void loop()
     esc0.writeMicroseconds(target_lp);
   }
 
-  /* print to serial console */
-  Serial.printf("B:%u, p={%4.2f, %4.2f} c=%4.2f esc=%d t=%u s=%4.0f prox=%4.2f\n"
-               , state, val_a, val_b, control, target_lp, tick, dist_mm, proximity_detected );
+  
+  // SENSOR ACTIVE
+  if (proximity_detected == 1.0f and !state_sensor_active) {
+    state_sensor_active = true;
+    playsound = Sound_t::s_sensor_active;
+    reset_idle();
+  }
+    
+  // SENSOR CLEAR  
+  if (proximity_detected < 0.99f and state_sensor_active) {
+    state_sensor_active = false;
+    playsound = Sound_t::s_sensor_clear;
+    reset_idle();
+  }
 
-  ++cycles;
+  // MOTOR START
+  if (persistence > 0.f and !state_motor_start) {
+    state_motor_start = true;
+    //playsound = Sound_t::s_motor_start;
+    reset_idle();
+  }
+
+  // STOP / IDLE
+  if (control < 0.01f and state_motor_start) {
+    state_motor_start = false;
+    reset_idle();
+  }
+
+  if (++idle_counter > 100 and not state_idle) {
+    playsound = Sound_t::s_stop_idle;
+    state_idle = true;
+  }
+  
+
+  /* play audio events */
+  switch(playsound) {
+  case s_sensor_active: audio.playFolder(2, 1); /*audio.disableLoop();*/ playsound = s_done; break;
+  case s_sensor_clear : audio.playFolder(2, 2); /*audio.disableLoop();*/ playsound = s_done; break;
+  case s_motor_start  : /*audio.playFolder(2, 3);*/ /*audio.disableLoop();*/ playsound = s_done; break;
+  case s_motor_fast   : /*audio.playFolder(2, 4); playsound = s_done; */ break;
+  case s_stop_idle    : audio.playFolder(1, 3); /*audio.enableLoop();*/ playsound = s_done; break;
+  
+  /* no action if done */
+  case s_done:
+  default: 
+      break;
+  }
+
+  /* check player status */
+  if (audio.available())
+      printDetail(audio.readType(), audio.read());
+
+ /* print to serial console */
+  Serial.printf("B:%u, p={%4.2f, %4.2f} c=%4.2f esc=%d s=%4.0f prox=%4.2f rot=%4.2f [%u:%u:%u] per=%4.2f\n"
+               , state, val_a, val_b, control, target_lp, dist_mm, proximity_detected, rotation, state_sensor_active, state_motor_start, state_idle, persistence); 
 }
 
 
+void printDetail(uint8_t type, int value) 
+{
+  switch (type) {
+    case TimeOut:              Serial.println("Time Out!");      break;
+    case WrongStack:           Serial.println("Stack Wrong!");   break;
+    case DFPlayerCardInserted: Serial.println("Card Inserted!"); break;
+    case DFPlayerCardRemoved:  Serial.println("Card Removed!");  break;
+    case DFPlayerCardOnline:   Serial.println("Card Online!");   break;
+    case DFPlayerUSBInserted:  Serial.println("USB Inserted!");  break;
+    case DFPlayerUSBRemoved:   Serial.println("USB Removed!");   break;
+    case DFPlayerPlayFinished: Serial.println("Play Finished!"); break;
+    case DFPlayerError:        
+      Serial.print("DFPlayerError:"); 
+      switch (value) {
+        case Busy:             Serial.println("Card not found");          break;
+        case Sleeping:         Serial.println("Sleeping");                break;
+        case SerialWrongStack: Serial.println("Get Wrong Stack");         break;
+        case CheckSumNotMatch: Serial.println("Check Sum Not Match");     break;
+        case FileIndexOut:     Serial.println("File Index Out of Bound"); break;
+        case FileMismatch:     Serial.println("Cannot Find File");        break; 
+        case Advertise:        Serial.println("In Advertise");            break;
+        default: break;
+      }
+      break;
+    default: break;
+  }
+}
 
   
